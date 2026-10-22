@@ -78,6 +78,13 @@ nav button.on{color:var(--accent);font-weight:700}
 .btn.block{width:100%}
 .link{background:none;border:0;color:var(--accent);font-weight:600;padding:8px 0}
 .notice{background:var(--soft);border:1px solid var(--brass);border-radius:12px;padding:10px 12px;font-size:14px;margin-bottom:10px}
+.syncb{display:flex;align-items:center;gap:8px;width:100%;background:none;border:0;padding:2px 2px 10px;font-size:13.5px;color:var(--muted);text-align:left}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--s-usa);flex:none}
+.dot.pend{background:var(--s-china)}
+.dot.err{background:var(--s-aduana)}
+.dot.sync{background:var(--s-prod);animation:pulse 1s infinite alternate}
+@keyframes pulse{from{opacity:.35}to{opacity:1}}
+@media (prefers-reduced-motion:reduce){.dot.sync{animation:none}}
 .hint{font-size:13.5px;color:var(--muted);margin:4px 0 10px}
 .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
@@ -187,6 +194,7 @@ nav button.on{color:var(--accent);font-weight:700}
     </div>
   </div>
   <div id="notice"></div>
+  <div id="syncbar"></div>
   <main id="app"></main>
 </div>
 
@@ -244,9 +252,12 @@ const store={
 };
 let S={settings:{name:'Gen Z',mult:2,rate:0,round:'0.5',theme:'auto'},products:[],orders:[],sales:[]};
 let saveT;
-function save(){clearTimeout(saveT);saveT=setTimeout(()=>store.set('inv-data',JSON.stringify(S)),250);}
+function save(){clearTimeout(saveT);saveT=setTimeout(()=>{store.set('inv-data',JSON.stringify(S));scheduleSync();},250);}
 async function getImg(id){if(!id)return null;if(imgs[id])return imgs[id];const v=await store.get('img:'+id);if(v)imgs[id]=v;return imgs[id]||null;}
 async function load(){
+  try{const ss=await store.get('session');session=ss?JSON.parse(ss):null;}catch(e){session=null;}
+  try{const sm=await store.get('sync-meta');if(sm)syncState=Object.assign(syncState,JSON.parse(sm));}catch(e){}
+  localOnly=(await store.get('local-only'))==='1';
   const raw=await store.get('inv-data');
   if(raw){try{const d=JSON.parse(raw);S=Object.assign(S,d,{settings:Object.assign(S.settings,d.settings||{})});}catch(e){}}
   render();
@@ -255,11 +266,204 @@ async function load(){
   S.orders.forEach(o=>o.items.forEach(i=>i.imgId&&ids.add(i.imgId)));
   for(const id of ids)await getImg(id);
   if(ids.size&&!ui.modal)render();
+  updateSyncbar();
+  if(session)syncNow();else if(!localOnly)openLogin();
 }
 
 /* ---------- estado de la interfaz ---------- */
 const ui={tab:'inv',q:'',filter:'all',period:'7',modal:null,draft:null,pdraft:null,sdraft:null,
   report:{date:today(),lines:[],q:''}};
+
+/* ---------- nube (Supabase) ---------- */
+const SB_URL='https://dfgdkslrlkgfcdgglnnu.supabase.co';
+const SB_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRmZ2Rrc2xybGtnZmNkZ2dsbm51Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI2OTIzMjQsImV4cCI6MjEwODI2ODMyNH0.d_wFR0FG5SBCgeLAzFnv9p15ky2D8GgyB2ai4UO9KrQ';
+const COLS=[['products','genz_products'],['orders','genz_orders'],['sales','genz_sales']];
+let session=null,localOnly=false,syncing=false,resync=false,syncT=null,refreshing=null;
+let syncStatus='idle',syncMsg='';
+let syncState={base:{products:{},orders:{},sales:{},settings:''},upImgs:{},lastSync:0};
+
+function canon(v){
+  if(Array.isArray(v))return '['+v.map(canon).join(',')+']';
+  if(v&&typeof v==='object')return '{'+Object.keys(v).filter(k=>v[k]!==undefined).sort().map(k=>JSON.stringify(k)+':'+canon(v[k])).join(',')+'}';
+  return JSON.stringify(v);
+}
+function settingsForSync(){const o=Object.assign({},S.settings);delete o.theme;return o;}
+function dirtyCount(){
+  let n=0;
+  COLS.forEach(c=>{
+    const base=syncState.base[c[0]],ids={};
+    S[c[0]].forEach(r=>{ids[r.id]=1;if(base[r.id]!==canon(r))n++;});
+    Object.keys(base).forEach(id=>{if(!ids[id])n++;});
+  });
+  if(canon(settingsForSync())!==syncState.base.settings)n++;
+  return n;
+}
+function authErr(){const e=new Error('sesión vencida');e.name='AuthError';return e;}
+async function httpErr(r){let e={};try{e=await r.json();}catch(x){}const err=new Error(e.message||('Error '+r.status));err.status=r.status;err.code=e.code;return err;}
+function setSession(d){
+  const u=d.user||(session&&session.user)||{};
+  session={access_token:d.access_token,refresh_token:d.refresh_token,expires_at:Date.now()+((d.expires_in||3600)*1000),user:{id:u.id,email:u.email}};
+  store.set('session',JSON.stringify(session));
+}
+async function refreshSession(){
+  const r=await fetch(SB_URL+'/auth/v1/token?grant_type=refresh_token',{method:'POST',headers:{apikey:SB_KEY,'Content-Type':'application/json'},body:JSON.stringify({refresh_token:session.refresh_token})});
+  if(!r.ok){if(r.status===400||r.status===401||r.status===403)throw authErr();throw new Error('refresh '+r.status);}
+  setSession(await r.json());
+}
+async function accessToken(){
+  if(!session)throw authErr();
+  if(session.expires_at-Date.now()<60000){
+    if(!refreshing)refreshing=refreshSession().finally(()=>{refreshing=null;});
+    await refreshing;
+  }
+  return session.access_token;
+}
+async function doLogin(email,pass){
+  let r;
+  try{r=await fetch(SB_URL+'/auth/v1/token?grant_type=password',{method:'POST',headers:{apikey:SB_KEY,'Content-Type':'application/json'},body:JSON.stringify({email:email,password:pass})});}
+  catch(e){throw new Error('Sin conexión. Inténtalo cuando tengas internet, o entra sin cuenta por ahora.');}
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(r.status===400?'Correo o contraseña incorrectos.':(d.msg||d.error_description||'No se pudo entrar.'));
+  setSession(d);
+}
+async function getAll(table,select,order){
+  const t=await accessToken();let out=[],from=0;
+  for(;;){
+    const r=await fetch(SB_URL+'/rest/v1/'+table+'?select='+select+(order?'&order='+order:''),{headers:{apikey:SB_KEY,Authorization:'Bearer '+t,'Range-Unit':'items',Range:from+'-'+(from+999)}});
+    if(!r.ok)throw await httpErr(r);
+    const rows=await r.json();out=out.concat(rows);
+    if(rows.length<1000)break;from+=1000;
+  }
+  return out;
+}
+async function upsert(table,rows,conflict){
+  const t=await accessToken();
+  const r=await fetch(SB_URL+'/rest/v1/'+table+'?on_conflict='+conflict,{method:'POST',headers:{apikey:SB_KEY,Authorization:'Bearer '+t,'Content-Type':'application/json',Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(rows)});
+  if(!r.ok)throw await httpErr(r);
+}
+function refImgIds(){
+  const ids=new Set();
+  S.products.forEach(p=>p.imgId&&ids.add(p.imgId));
+  S.orders.forEach(o=>o.items.forEach(i=>i.imgId&&ids.add(i.imgId)));
+  return ids;
+}
+async function pushAll(){
+  const uid=session.user.id,now=new Date().toISOString();
+  if(!syncState.base.settings){
+    const st=await getAll('genz_settings','data','');
+    if(st.length){S.settings=Object.assign({},S.settings,st[0].data);syncState.base.settings=canon(settingsForSync());}
+  }
+  for(const c of COLS){
+    const col=c[0],table=c[1],base=syncState.base[col],rows=[],ids={};
+    S[col].forEach(r=>{ids[r.id]=1;if(base[r.id]!==canon(r))rows.push({owner_id:uid,id:r.id,data:r,updated_at:now,deleted:false});});
+    Object.keys(base).forEach(id=>{if(!ids[id])rows.push({owner_id:uid,id:id,data:JSON.parse(base[id]),updated_at:now,deleted:true});});
+    for(let i=0;i<rows.length;i+=100)await upsert(table,rows.slice(i,i+100),'owner_id,id');
+    rows.forEach(rw=>{if(rw.deleted)delete base[rw.id];else base[rw.id]=canon(rw.data);});
+  }
+  const cs=canon(settingsForSync());
+  if(cs!==syncState.base.settings){
+    await upsert('genz_settings',[{owner_id:uid,data:settingsForSync(),updated_at:now}],'owner_id');
+    syncState.base.settings=cs;
+  }
+}
+async function pullAll(){
+  let changed=false;
+  for(const c of COLS){
+    const col=c[0],base=syncState.base[col];
+    const rows=await getAll(c[1],'id,data,deleted','id.asc');
+    for(const row of rows){
+      const idx=S[col].findIndex(x=>x.id===row.id);
+      const cur=idx>=0?S[col][idx]:null;
+      const dirty=cur&&base[row.id]!==canon(cur);
+      if(row.deleted){
+        if(cur&&!dirty){S[col].splice(idx,1);changed=true;}
+        if(!dirty)delete base[row.id];
+        continue;
+      }
+      const rj=canon(row.data);
+      if(!cur){S[col].push(row.data);base[row.id]=rj;changed=true;}
+      else if(!dirty&&canon(cur)!==rj){S[col][idx]=row.data;base[row.id]=rj;changed=true;}
+    }
+  }
+  const st=await getAll('genz_settings','data','');
+  if(st.length&&canon(settingsForSync())===syncState.base.settings){
+    const rj=canon(st[0].data);
+    if(rj!==syncState.base.settings){S.settings=Object.assign({},S.settings,st[0].data);syncState.base.settings=canon(settingsForSync());changed=true;}
+  }
+  if(changed){await store.set('inv-data',JSON.stringify(S));render();}
+}
+async function downloadImg(uid,id){
+  const t=await accessToken();
+  const r=await fetch(SB_URL+'/storage/v1/object/authenticated/genz-fotos/'+uid+'/'+id+'.jpg',{headers:{apikey:SB_KEY,Authorization:'Bearer '+t}});
+  if(!r.ok)return false;
+  const b=await r.blob();
+  const url=await new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(fr.result);fr.onerror=rej;fr.readAsDataURL(b);});
+  imgs[id]=url;await store.set('img:'+id,url);return true;
+}
+async function syncImages(){
+  const uid=session.user.id;let got=false;
+  for(const id of Array.from(refImgIds())){
+    if(!imgs[id]){const v=await store.get('img:'+id);if(v)imgs[id]=v;}
+    if(imgs[id]){
+      if(!syncState.upImgs[id]){
+        const blob=await (await fetch(imgs[id])).blob();
+        const t=await accessToken();
+        const r=await fetch(SB_URL+'/storage/v1/object/genz-fotos/'+uid+'/'+id+'.jpg',{method:'POST',headers:{apikey:SB_KEY,Authorization:'Bearer '+t,'Content-Type':'image/jpeg','x-upsert':'true'},body:blob});
+        if(!r.ok)throw await httpErr(r);
+        syncState.upImgs[id]=1;
+      }
+    }else if(await downloadImg(uid,id)){syncState.upImgs[id]=1;got=true;}
+  }
+  if(got)render();
+}
+function setSync(st,msg){syncStatus=st;syncMsg=msg||'';updateSyncbar();}
+function ago(ts){const m=Math.round((Date.now()-ts)/60000);return m<1?'ahora mismo':m<60?'hace '+m+' min':'hace '+Math.round(m/60)+' h';}
+function updateSyncbar(){
+  const el=$('#syncbar');if(!el)return;
+  if(!session){el.innerHTML=localOnly?'<button class="syncb" data-act="open-login"><i class="dot pend"></i>Solo en este teléfono. Toca para iniciar sesión y guardar en la nube.</button>':'';return;}
+  let n=0;try{n=dirtyCount();}catch(e){}
+  let d='ok',t='';
+  if(syncStatus==='syncing'){d='sync';t='Sincronizando…';}
+  else if(syncStatus==='offline'){d='pend';t='Sin conexión'+(n?' · '+n+' cambio'+(n===1?'':'s')+' por subir':'');}
+  else if(syncStatus==='auth'){d='err';t='Tu sesión venció. Toca para iniciar sesión.';}
+  else if(syncStatus==='error'){d='err';t=syncMsg||'No se pudo sincronizar. Toca para reintentar.';}
+  else if(n>0){d='pend';t=n+' cambio'+(n===1?'':'s')+' por subir';}
+  else{t='Guardado en la nube'+(syncState.lastSync?' · '+ago(syncState.lastSync):'');}
+  el.innerHTML='<button class="syncb" data-act="'+(syncStatus==='auth'?'open-login':'sync-now')+'"><i class="dot '+d+'"></i>'+esc(t)+'</button>';
+}
+function failSync(e){
+  if(e&&(e.name==='AuthError'||e.status===401)){setSync('auth');return;}
+  if(e instanceof TypeError||!navigator.onLine){setSync('offline');return;}
+  let m='No se pudo sincronizar. Toca para reintentar.';
+  if(e&&(e.status===403||e.code==='42501'))m='Tu usuario no está autorizado en Gen Z. Falta el último paso del script SQL.';
+  else if(e&&(e.code==='PGRST205'||e.code==='42P01'||e.status===404))m='Faltan las tablas de Gen Z en Supabase. Ejecuta el script SQL.';
+  setSync('error',m);
+}
+async function persistSync(){await store.set('sync-meta',JSON.stringify(syncState));}
+async function syncNow(){
+  if(!session)return;
+  if(syncing){resync=true;return;}
+  syncing=true;setSync('syncing');
+  try{
+    await pushAll();
+    await pullAll();
+    await syncImages();
+    syncState.lastSync=Date.now();
+    await persistSync();
+    setSync('ok');
+  }catch(e){await persistSync();failSync(e);}
+  finally{syncing=false;if(resync){resync=false;setTimeout(()=>syncNow(),600);}}
+}
+function scheduleSync(){
+  updateSyncbar();
+  if(!session)return;
+  clearTimeout(syncT);
+  syncT=setTimeout(()=>{if(navigator.onLine)syncNow();else setSync('offline');},2500);
+}
+window.addEventListener('online',()=>syncNow());
+window.addEventListener('offline',()=>{if(session)setSync('offline');});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&session&&Date.now()-syncState.lastSync>60000)syncNow();});
+setInterval(()=>{if(session&&!document.hidden){if(Date.now()-syncState.lastSync>300000)syncNow();else updateSyncbar();}},60000);
 
 /* ---------- tema ---------- */
 const MOON='<svg viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
@@ -523,11 +727,12 @@ function renderModal(){
   if(ui.modal==='order')h=ui.draft.status==='recibido'?orderView():orderForm();
   else if(ui.modal==='prod')h=prodForm();
   else if(ui.modal==='set')h=settingsForm();
+  else if(ui.modal==='login')h=loginForm();
   m.innerHTML=h;
   const s=m.querySelector('.sheet');if(s&&top)s.scrollTop=top;
   document.body.style.overflow=ui.modal?'hidden':'';
 }
-function closeModal(){ui.modal=null;ui.draft=ui.pdraft=ui.sdraft=null;renderModal();}
+function closeModal(){ui.modal=null;ui.draft=ui.pdraft=ui.sdraft=ui.ldraft=null;renderModal();}
 function head(title){return '<div class="sh-head"><button class="link" data-act="close">‹ Volver</button><h2>'+esc(title)+'</h2></div>';}
 
 /* Pedido: formulario */
@@ -637,6 +842,21 @@ function updProd(){
   el.innerHTML=t||'Si dejas el precio vacío se usa el mínimo.';
 }
 
+/* Acceso */
+function openLogin(){ui.ldraft={email:(session&&session.user&&session.user.email)||'',password:'',error:'',busy:false};ui.modal='login';renderModal();}
+function loginForm(){
+  const L=ui.ldraft;const logo=(document.querySelector('.logo img')||{}).src||'';
+  return '<div class="sheet"><div class="sh-body" style="padding-top:40px">'+
+    '<div class="logo" style="justify-content:center"><img src="'+logo+'" alt=""><h1 class="brand">Gen Z</h1></div>'+
+    '<p class="tag" style="text-align:center;margin:6px 0 22px">Tu pasión, tu negocio</p>'+
+    '<div class="card"><label>Correo<input type="email" inputmode="email" autocomplete="username" data-scope="login" data-bind="email" value="'+esc(L.email)+'"></label>'+
+    '<label>Contraseña<input type="password" autocomplete="current-password" data-scope="login" data-bind="password" value="'+esc(L.password)+'"></label>'+
+    (L.error?'<p class="warn" style="margin:0 0 10px">'+esc(L.error)+'</p>':'')+
+    '<button class="btn primary block" data-act="login"'+(L.busy?' disabled':'')+'>'+(L.busy?'Entrando…':'Entrar')+'</button></div>'+
+    '<div style="text-align:center"><button class="link" data-act="skip-login">Entrar sin cuenta por ahora</button>'+
+    '<p class="hint">Con tu cuenta, tus productos, pedidos, ventas y fotos se guardan en la nube y los ves desde cualquier equipo.</p></div></div></div>';
+}
+
 /* Ajustes */
 function settingsForm(){
   const T=ui.sdraft;
@@ -649,6 +869,7 @@ function settingsForm(){
     '<p class="hint">Cambiar el multiplicador no modifica los precios que ya tienes. Usa este botón para subir al mínimo los productos que quedaron por debajo.</p>'+
     '<button class="btn block" data-act="raise-prices">Subir precios al mínimo</button>'+
     '<button class="btn block" data-act="install" style="margin-top:10px">Instalar app en este teléfono</button>'+
+    '<h3>Cuenta y nube</h3><div class="card">'+(session?'<small>Conectado como</small><div><b>'+esc(session.user.email||'')+'</b></div><div class="row2" style="margin-top:10px"><button class="btn" data-act="sync-now">Sincronizar ahora</button><button class="btn danger" data-act="logout">Cerrar sesión</button></div>':'<p class="hint" style="margin-top:0">Tus datos están solo en este teléfono.</p><button class="btn primary block" data-act="open-login">Iniciar sesión</button>')+'</div>'+
     '<h3>Copia de seguridad</h3><p class="hint">Tus datos se guardan en este teléfono. Haz una copia de vez en cuando por si cambias de teléfono o borras los datos del navegador: copia el texto y guárdalo en un lugar seguro. Para recuperarlo, pégalo aquí y toca Restaurar.</p>'+
     '<div class="row2"><button class="btn" data-act="copy-backup">Copiar copia</button><button class="btn" data-act="restore-backup">Restaurar</button></div>'+
     '<textarea id="bk" rows="4" placeholder="Aquí aparece la copia, o pega una para restaurar" style="margin-top:10px"></textarea></div>'+
@@ -697,6 +918,28 @@ const A={
   tab(t){ui.tab=t.dataset.tab;render();window.scrollTo(0,0);},
   filter(t){ui.filter=t.dataset.f;render();},
   period(t){ui.period=t.dataset.p;render();},
+  'open-login'(){closeModal();openLogin();},
+  async login(){
+    const L=ui.ldraft;if(!L||L.busy)return;
+    const email=(L.email||'').trim();
+    if(!email||!L.password){L.error='Escribe tu correo y tu contraseña.';renderModal();return;}
+    L.busy=true;L.error='';renderModal();
+    try{await doLogin(email,L.password);localOnly=false;store.set('local-only','0');closeModal();toast('Sesión iniciada');updateSyncbar();syncNow();}
+    catch(e){L.busy=false;L.error=e.message;renderModal();}
+  },
+  'skip-login'(){localOnly=true;store.set('local-only','1');closeModal();updateSyncbar();},
+  async 'sync-now'(){toast('Sincronizando…');await syncNow();if(syncStatus==='ok')toast('Todo está sincronizado');},
+  async logout(){
+    await syncNow();
+    const n=dirtyCount();
+    if(!armed('logout',n>0?'Hay '+n+' cambio'+(n===1?'':'s')+' sin subir. Toca otra vez para cerrar sesión y perderlos':'Toca otra vez para cerrar sesión. Los datos de este teléfono se borran; en la nube siguen guardados'))return;
+    Object.keys(imgs).forEach(id=>{store.set('img:'+id,'');delete imgs[id];});
+    const th=S.settings.theme;
+    S={settings:{name:'Gen Z',mult:2,rate:0,round:'0.5',theme:th},products:[],orders:[],sales:[]};
+    session=null;localOnly=false;syncState={base:{products:{},orders:{},sales:{},settings:''},upImgs:{},lastSync:0};
+    await store.set('inv-data',JSON.stringify(S));await store.set('session','');await store.set('sync-meta',JSON.stringify(syncState));await store.set('local-only','0');
+    closeModal();render();updateSyncbar();openLogin();
+  },
   async install(){if(!deferredInstall)return toast('Abre el menú del navegador y elige "Instalar app" o "Agregar a pantalla de inicio".');deferredInstall.prompt();try{await deferredInstall.userChoice;}catch(e){}deferredInstall=null;},
   'toggle-theme'(){S.settings.theme=effTheme()==='dark'?'light':'dark';save();applyTheme();},
   settings(){ui.sdraft=clone(S.settings);ui.modal='set';renderModal();},
@@ -814,7 +1057,7 @@ function setPath(obj,path,val){
 function onInput(e){
   const t=e.target;
   if(t.dataset.scope){
-    const obj={order:ui.draft,prod:ui.pdraft,set:ui.sdraft}[t.dataset.scope];
+    const obj={order:ui.draft,prod:ui.pdraft,set:ui.sdraft,login:ui.ldraft}[t.dataset.scope];
     if(!obj)return;
     setPath(obj,t.dataset.bind,t.value);
     if(t.dataset.scope==='order')updOrder();
@@ -831,6 +1074,7 @@ function onInput(e){
   }
 }
 document.addEventListener('input',onInput);
+document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.dataset&&e.target.dataset.scope==='login'){e.preventDefault();A.login();}});
 document.addEventListener('change',e=>{
   const t=e.target;
   if(t.id==='file'){handleFile(t);return;}
